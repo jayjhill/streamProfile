@@ -521,7 +521,7 @@ const App = () => {
         const result = await elevationService.querySelectedLine(
           mapInstance,
           [event.point.x, event.point.y],
-          ["all_streams"]
+          ["all_streams", "gold_streams"]
         );
 
         if (result && result.coordinates) {
@@ -551,9 +551,9 @@ const App = () => {
 
     // Handle clicks on the map background to clear selection
     const handleBackgroundClick = (event) => {
-      // Check if click was on a stream
+      // Check if click was on any stream layer
       const features = mapInstance.queryRenderedFeatures(event.point, {
-        layers: ["all_streams"],
+        layers: ["all_streams", "gold_streams"],
       });
 
       // If no stream was clicked, clear the selection
@@ -572,92 +572,103 @@ const App = () => {
       });
       mapInstance.setTerrain({ source: "mapbox-dem", exaggeration: 1.5 });
 
-      // Add USGS NHD Flowlines using GeoJSON from ArcGIS REST API
-      mapInstance.addSource("nhd_flowlines", {
-        type: "geojson",
-        data: {
-          type: "FeatureCollection",
-          features: [], // Start empty, will be populated when map moves
-        },
-        cluster: false,
-        lineMetrics: true,
+      // Add NHD Streams using the vector tile source
+      mapInstance.addSource("nhd_streams", {
+        type: "vector",
+        tiles: ["https://app.tileserv.com/tiles/public.fff_nhd_streams/{z}/{x}/{y}.pbf"],
+        minzoom: 4,
+        maxzoom: 22,
       });
 
-      // Add all streams layer
+      // Add trout streams layer (primary layer for interaction)
       mapInstance.addLayer({
         id: "all_streams",
         type: "line",
-        source: "nhd_flowlines",
+        source: "nhd_streams",
+        "source-layer": "public.fff_nhd_streams",
         paint: {
-          "line-color": "#4A90E2",
+          "line-color": [
+            "case",
+            ["==", ["get", "is_trout"], 1], "#4A90E2", // Blue for trout streams
+            "#8B9DC3" // Lighter blue for non-trout streams
+          ],
           "line-width": [
             "interpolate",
             ["linear"],
             ["zoom"],
             8,
-            1,
+            [
+              "case",
+              ["==", ["get", "is_trout"], 1], 2, // Thicker for trout streams
+              1
+            ],
             12,
-            2,
+            [
+              "case",
+              ["==", ["get", "is_trout"], 1], 3,
+              2
+            ],
             16,
-            3,
+            [
+              "case",
+              ["==", ["get", "is_trout"], 1], 4,
+              3
+            ],
           ],
-          "line-opacity": 0.7,
+          "line-opacity": [
+            "case",
+            ["==", ["get", "is_trout"], 1], 0.8, // More opaque for trout streams
+            0.5
+          ],
         },
-        filter: ["!=", ["get", "FTYPE"], 336], // Exclude canals/ditches
+        filter: ["!=", ["get", "is_ditch"], 1], // Exclude ditches
       });
 
-      // Function to load streams for current view
-      const loadStreamsForView = async () => {
-        const bounds = mapInstance.getBounds();
-        const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
-
-        try {
-          const url =
-            `https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/4/query?` +
-            `where=1=1&` +
-            `outFields=*&` +
-            `geometry=${bbox}&` +
-            `geometryType=esriGeometryEnvelope&` +
-            `inSR=4326&` +
-            `spatialRel=esriSpatialRelIntersects&` +
-            `outSR=4326&` +
-            `f=geojson&` +
-            `maxRecordCount=1000`;
-
-          const response = await fetch(url);
-          if (response.ok) {
-            const data = await response.json();
-
-            // Update the source with new data
-            mapInstance.getSource("nhd_flowlines").setData(data);
-          }
-        } catch (error) {
-          console.warn("Failed to load stream data:", error);
-        }
-      };
-
-      // Load initial data
-      loadStreamsForView();
-
-      // Reload data when map finishes moving
-      mapInstance.on("moveend", () => {
-        if (mapInstance.getZoom() >= 8) {
-          // Only load at sufficient zoom level
-          loadStreamsForView();
-        }
+      // Add a special layer for gold/premium trout streams
+      mapInstance.addLayer({
+        id: "gold_streams",
+        type: "line",
+        source: "nhd_streams",
+        "source-layer": "public.fff_nhd_streams",
+        paint: {
+          "line-color": "#FFD700", // Gold color
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            8,
+            2,
+            12,
+            3,
+            16,
+            4,
+          ],
+          "line-opacity": 0.9,
+        },
+        filter: ["all",
+          ["==", ["get", "is_gold"], 1],
+          ["==", ["get", "is_trout"], 1]
+        ],
       });
 
-      // Add click handler for stream layer
+      // Add click handler for stream layers
       mapInstance.on("click", "all_streams", handleMapClick);
+      mapInstance.on("click", "gold_streams", handleMapClick);
 
       // Add click handler for map background
       mapInstance.on("click", handleBackgroundClick);
 
-      // Change cursor on hover
+      // Change cursor on hover for both stream layers
       mapInstance.on("mouseenter", "all_streams", () => {
         mapInstance.getCanvas().style.cursor = "pointer";
       });
       mapInstance.on("mouseleave", "all_streams", () => {
+        mapInstance.getCanvas().style.cursor = "";
+      });
+      mapInstance.on("mouseenter", "gold_streams", () => {
+        mapInstance.getCanvas().style.cursor = "pointer";
+      });
+      mapInstance.on("mouseleave", "gold_streams", () => {
         mapInstance.getCanvas().style.cursor = "";
       });
     });
@@ -680,8 +691,8 @@ const App = () => {
   return (
     <div className="app-container">
       <header className="header">
-        <h1>Stream Elevation Profile</h1>
-        <p>USGS National Hydrography Dataset and 3DEP Elevation Data</p>
+        <h1>Trout Stream Elevation Profile</h1>
+        <p>FFF Trout Streams and 3DEP Elevation Data</p>
       </header>
 
       <div className="map-container">
