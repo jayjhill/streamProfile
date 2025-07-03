@@ -69,31 +69,129 @@ class ElevationProfileService {
     return distances;
   }
 
-  async getElevationFromMapbox(map, coordinates) {
+  // New method using USGS 3DEP Elevation ImageServer
+  async getElevationFromUSGS3DEP(coordinates) {
     try {
-      // Skip Mapbox elevation entirely since the API is deprecated
-      // and causing 404 errors. Go straight to Open Elevation.
-      console.log(
-        "Skipping Mapbox elevation API (deprecated/unreliable) - using Open Elevation instead"
-      );
-      throw new Error("Mapbox elevation API skipped");
-    } catch (error) {
-      console.log("Mapbox elevation skipped:", error.message);
-      throw error;
-    }
-  }
-
-  // Fallback method using Open Elevation API
-  async getElevationFromOpenElevation(coordinates) {
-    try {
-      const maxPoints = 50; // Increased from 30 since we're not using Mapbox anymore
+      // Optimize coordinate sampling for better performance
+      const maxPoints = 50; // Reduce points for USGS API limitations
       const step = Math.max(1, Math.floor(coordinates.length / maxPoints));
       const sampledCoords = coordinates.filter(
         (_, index) => index % step === 0
       );
 
       console.log(
-        `Using Open Elevation for ${sampledCoords.length} points (optimized)`
+        `Using USGS 3DEP for ${sampledCoords.length} points (optimized from ${coordinates.length})`
+      );
+
+      // Process points individually for better reliability
+      const allElevationData = [];
+      
+      for (const coord of sampledCoords) {
+        try {
+          const elevation = await this.getSingleElevationUSGS3DEP(coord);
+          allElevationData.push(elevation);
+          
+          // Small delay to be respectful to the API
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+        } catch (error) {
+          console.warn(`Error processing point ${coord}:`, error);
+          allElevationData.push(0); // Default to 0 on error
+        }
+      }
+
+      const distances = this.calculateCumulativeDistances(sampledCoords);
+
+      const elevationData = sampledCoords.map((coord, index) => ({
+        longitude: coord[0],
+        latitude: coord[1],
+        elevation: allElevationData[index],
+        distance: distances[index],
+        distanceKm: distances[index] / 1000,
+      }));
+
+      console.log(
+        `Successfully retrieved USGS 3DEP elevation data for ${elevationData.length} points`
+      );
+      
+      return elevationData;
+    } catch (error) {
+      console.error("USGS 3DEP API failed:", error);
+      throw error;
+    }
+  }
+
+  // Helper method to get elevation for a single coordinate
+  async getSingleElevationUSGS3DEP(coordinate) {
+    const baseUrl = 'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/identify';
+    
+    // Use the correct geometry format for a single point
+    const params = new URLSearchParams({
+      f: 'json',
+      geometry: `{"x":${coordinate[0]},"y":${coordinate[1]},"spatialReference":{"wkid":4326}}`,
+      geometryType: 'esriGeometryPoint',
+      returnGeometry: 'false',
+      returnCatalogItems: 'false',
+      pixelSize: '', // Let service determine pixel size
+      time: '',
+      renderingRule: '', // Use default rendering rule for elevation
+      interpolation: 'RSP_BilinearInterpolation'
+    });
+
+    const response = await fetch(`${baseUrl}?${params.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`USGS 3DEP HTTP error for point ${coordinate}: ${response.status}`);
+    }
+
+    const data = await response.json();
+    
+    if (data.error) {
+      throw new Error(`USGS 3DEP API error for point ${coordinate}: ${data.error.message}`);
+    }
+
+    // Extract elevation value from response
+    let elevation = 0;
+    
+    if (data.value !== undefined && data.value !== null) {
+      // Single pixel value response
+      elevation = data.value;
+    } else if (data.catalogItems && data.catalogItems.features && data.catalogItems.features.length > 0) {
+      // Try to get from catalog items
+      const feature = data.catalogItems.features[0];
+      if (feature.attributes && feature.attributes.Pixel_Value !== undefined) {
+        elevation = feature.attributes.Pixel_Value;
+      }
+    } else if (data.name === "Pixel" && data.value) {
+      // Alternative response format
+      if (typeof data.value === 'string') {
+        // Parse space-delimited values and take first one
+        const values = data.value.split(' ');
+        elevation = parseFloat(values[0]) || 0;
+      } else {
+        elevation = data.value;
+      }
+    }
+
+    return elevation;
+  }
+
+  // Fallback method using Open Elevation API (keep as backup)
+  async getElevationFromOpenElevation(coordinates) {
+    try {
+      const maxPoints = 50;
+      const step = Math.max(1, Math.floor(coordinates.length / maxPoints));
+      const sampledCoords = coordinates.filter(
+        (_, index) => index % step === 0
+      );
+
+      console.log(
+        `Using Open Elevation fallback for ${sampledCoords.length} points`
       );
 
       const locations = sampledCoords.map((coord) => ({
@@ -113,7 +211,7 @@ class ElevationProfileService {
       );
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`Open Elevation HTTP error! status: ${response.status}`);
       }
 
       const data = await response.json();
@@ -128,7 +226,7 @@ class ElevationProfileService {
       }));
 
       console.log(
-        `Successfully retrieved elevation data for ${elevationData.length} points`
+        `Successfully retrieved Open Elevation fallback data for ${elevationData.length} points`
       );
       return elevationData;
     } catch (error) {
@@ -148,12 +246,18 @@ class ElevationProfileService {
 
     let elevationData;
 
-    // Use Open Elevation directly since Mapbox elevation API is deprecated/broken
+    // Try USGS 3DEP first, fallback to Open Elevation if it fails
     try {
-      elevationData = await this.getElevationFromOpenElevation(coordinates);
+      console.log('Attempting to use USGS 3DEP elevation service...');
+      elevationData = await this.getElevationFromUSGS3DEP(coordinates);
     } catch (error) {
-      console.error("Elevation API failed:", error);
-      throw new Error("Failed to get elevation data. Please try again.");
+      console.warn('USGS 3DEP failed, falling back to Open Elevation:', error.message);
+      try {
+        elevationData = await this.getElevationFromOpenElevation(coordinates);
+      } catch (fallbackError) {
+        console.error("All elevation services failed:", fallbackError);
+        throw new Error("Failed to get elevation data from all sources. Please try again.");
+      }
     }
 
     const elevations = elevationData.map((point) => point.elevation);
@@ -577,7 +681,7 @@ const App = () => {
     <div className="app-container">
       <header className="header">
         <h1>Stream Elevation Profile</h1>
-        <p>USGS National Hydrography Dataset and Open Elevation Data</p>
+        <p>USGS National Hydrography Dataset and 3DEP Elevation Data</p>
       </header>
 
       <div className="map-container">
@@ -610,7 +714,7 @@ const App = () => {
             </button>
             <div className="stats-grid">
               <div className="stat-item">
-                <div className="stat-label">Distance (Updated)</div>
+                <div className="stat-label">Distance</div>
                 <div className="stat-value">
                   {formatDistance(
                     elevationProfile.statistics.totalDistanceMeters
